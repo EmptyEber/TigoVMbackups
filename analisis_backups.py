@@ -1,57 +1,82 @@
 import os
 import logging
-from collections import defaultdict
+from collections import defaultdict, Counter
 from datetime import datetime
 from dateutil import parser
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import openpyxl
-import tkinter as tk
-from tkinter import messagebox
 from openpyxl.styles import PatternFill
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
 
 # --- CONFIGURACIÓN ---
-RUTA_INFORMES = "C:/Users/eromerov/TIGOinformes"  
-RUTA_EXPORTACION = "C:/Users/eromerov/resumenes_backups"
-CONFIGURACION_FECHA_HORA = '%Y-%m-%d %H:%M:%S'
+RUTA_INFORMES = "InformesSinProcesar"
+RUTA_EXPORTACION = "InformesExportados"
+CONFIGURACION_FECHA_HORA = '%Y-%m-%d %H:%M:%S' # Se mantiene para la exportación detallada
 
 # --- Logging ---
 logging.basicConfig(filename='log_analisis_backups_app.txt', level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
+
 def buscar_encabezados(sheet):
-    """
-    Busca los encabezados correctos en las primeras 20 filas.
-    """
+    posibles = {
+        'object name': ['object name', 'servidor'],
+        'job name': ['job name', 'nombre del job'],
+        'start time': ['start time', 'hora de inicio'],
+        'finish time': ['finish time', 'hora de fin'],
+        'duration': ['duration', 'duración'],
+        'data read, gb': ['data read, gb', 'datos leídos'],
+        'actual total backup size, gb': ['actual total backup size, gb', 'tamaño backup'],
+        'backup status': ['backup status', 'estado']
+    }
     for row_idx in range(1, 21):
-        headers = {}
-        for idx, cell in enumerate(sheet[row_idx]):
-            if cell.value:
-                headers[cell.value.strip().lower()] = idx
-
-        requeridos = [
-            'object name', 'job name', 'start time', 'finish time',
-            'duration', 'data read, gb', 'actual total backup size, gb', 'backup status'
-        ]
-        if all(r in headers for r in requeridos):
-            return headers, row_idx + 1  # Fila de inicio de datos
-
+        row = sheet[row_idx]
+        encabezados = {}
+        for idx, cell in enumerate(row):
+            valor = str(cell.value).strip().lower() if cell.value else ""
+            for clave, aliases in posibles.items():
+                if valor in aliases and clave not in encabezados:
+                    encabezados[clave] = idx
+        if len(encabezados) == len(posibles):
+            return encabezados, row_idx + 1
     return None, None
 
-def analizar_informes(ruta_informes):
-    """
-    Lee todos los informes y devuelve backups agrupados por servidor.
-    """
-    backups_por_servidor = defaultdict(list)
-    archivos = [os.path.join(ruta_informes, f) for f in os.listdir(ruta_informes) if f.endswith('.xlsx')]
 
+def filtrar_fallos_reales(backups_por_servidor):
+    filtrados = defaultdict(list)
+    agrupados = defaultdict(list)
+    for servidor, historial in backups_por_servidor.items():
+        for b in historial:
+            # Clave para agrupar por servidor, nombre de trabajo y día
+            clave = (servidor, b['nombre_trabajo'], b['inicio'].date())
+            agrupados[clave].append(b)
+
+    for clave, ejecuciones in agrupados.items():
+        # Si ninguna de las ejecuciones para esa clave fue 'success', se considera falla
+        if not any(e['estado'] == 'success' for e in ejecuciones):
+            for e in ejecuciones:
+                filtrados[clave[0]].append(e) # Agrega las fallas al servidor correspondiente
+    return filtrados
+
+
+def analizar_informes(ruta_informes):
+    backups_por_servidor = defaultdict(list)
+    trabajos_por_servidor = defaultdict(set)
+    fechas_por_servidor_y_trabajo = defaultdict(set)
+    trabajos = set()
+    servidores = set()
+    fechas = set()
+
+    archivos = [os.path.join(ruta_informes, f) for f in os.listdir(ruta_informes) if f.endswith('.xlsx')]
     if not archivos:
         logging.warning("No hay archivos en la carpeta de informes.")
-        return backups_por_servidor
+        return backups_por_servidor, trabajos_por_servidor, trabajos, servidores, fechas, fechas_por_servidor_y_trabajo
 
     for archivo in archivos:
         try:
             workbook = openpyxl.load_workbook(archivo, data_only=True)
             sheet = workbook.active
-
             headers, fila_inicio = buscar_encabezados(sheet)
             if not headers:
                 logging.error(f"No se encontraron encabezados válidos en {archivo}")
@@ -62,189 +87,272 @@ def analizar_informes(ruta_informes):
                     servidor = row[headers['object name']]
                     if not servidor:
                         continue
-
                     fecha_inicio = parser.parse(str(row[headers['start time']]))
                     fecha_fin = parser.parse(str(row[headers['finish time']]))
+                    estado = str(row[headers['backup status']]).lower().strip()
+                    trabajo = row[headers['job name']]
 
                     backup = {
-                        'nombre_trabajo': row[headers['job name']],
+                        'nombre_trabajo': trabajo,
                         'inicio': fecha_inicio,
                         'fin': fecha_fin,
                         'duracion': row[headers['duration']],
                         'data_read': row[headers['data read, gb']],
                         'tamano_backup': row[headers['actual total backup size, gb']],
-                        'estado': str(row[headers['backup status']]).lower().strip()
+                        'estado': estado
                     }
 
                     backups_por_servidor[servidor].append(backup)
+                    trabajos.add(trabajo)
+                    trabajos_por_servidor[servidor].add(trabajo)
+                    servidores.add(servidor)
+                    fechas.add(fecha_inicio.date())
+                    fechas_por_servidor_y_trabajo[(servidor, trabajo)].add(fecha_inicio.date())
                 except Exception as e:
                     logging.warning(f"Error en fila de {archivo}: {e}")
-
         except Exception as e:
             logging.error(f"No se pudo procesar {archivo}: {e}")
 
-    return backups_por_servidor
+    backups_filtrados = filtrar_fallos_reales(backups_por_servidor)
+    return backups_filtrados, trabajos_por_servidor, sorted(trabajos), sorted(servidores), sorted(fechas), fechas_por_servidor_y_trabajo
 
-def determinar_estado_final(historial):
-    fallo_detectado = False
 
-    for intento in historial:
-        if intento['estado'] in ('failed', 'warning'):
-            fallo_detectado = True
-        elif intento['estado'] == 'success':
-            return "Éxito (Recuperado de Fallo)" if fallo_detectado else "Éxito"
-
-    return "Fallido" if fallo_detectado else "Sin Datos"
-
-def exportar_resumenes(backups_por_servidor, resumen_estados):
-    """
-    Exporta dos archivos:
-    1. Resumen de estados finales
-    2. Historial detallado
-    """
+def exportar_excel(resultados):
     if not os.path.exists(RUTA_EXPORTACION):
         os.makedirs(RUTA_EXPORTACION)
 
-    fecha_actual = datetime.now().strftime("%Y-%m")
+    fecha_actual = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    ruta_archivo = os.path.join(RUTA_EXPORTACION, f"InformeGenerado_{fecha_actual}.xlsx")
 
-    # Resumen de Estados
-    wb_resumen = openpyxl.Workbook()
-    sheet_resumen = wb_resumen.active
-    sheet_resumen.title = "Resumen Estado Final"
-    sheet_resumen.append(["Servidor", "Estado Final"])
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Auditoría Fallas" # Título más específico
+    # Columnas para la exportación sin 'Duración' y 'Data Read (GB)'
+    ws.append(["Servidor", "Nombre Trabajo", "Inicio", "Fin", "Tamaño Backup (GB)", "Estado"])
 
-    verde = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-    rojo = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-    amarillo = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+    colores = {
+        "success": "C6EFCE", # No se espera 'success' en las fallas, pero se mantiene por si acaso
+        "failed": "FFC7CE",
+        "warning": "FFEB9C"
+    }
 
-    for servidor, estado in resumen_estados.items():
-        sheet_resumen.append([servidor, estado])
-        celda_estado = sheet_resumen.cell(row=sheet_resumen.max_row, column=2)
-        if estado.startswith("Éxito"):
-            celda_estado.fill = verde
-        elif estado == "Fallido":
-            celda_estado.fill = rojo
-        else:
-            celda_estado.fill = amarillo
+    resumen_estado = Counter()
+    # Solo exportar las fallas de cada día por servidor (comportamiento de distinct)
+    fallas_por_dia_servidor_trabajo = {}
+    for r in resultados:
+        clave_diaria = (r['servidor'], r['nombre_trabajo'], r['inicio'].date())
+        # Guarda solo la última ocurrencia del día si hay varias, o la primera si es la única
+        if clave_diaria not in fallas_por_dia_servidor_trabajo or r['inicio'] > fallas_por_dia_servidor_trabajo[clave_diaria]['inicio']:
+            fallas_por_dia_servidor_trabajo[clave_diaria] = r
 
-    wb_resumen.save(os.path.join(RUTA_EXPORTACION, f"resumen_estado_backups_{fecha_actual}.xlsx"))
-    print(f"✅ Resumen exportado en: resumenes_backups/resumen_estado_backups_{fecha_actual}.xlsx")
-
-        # Historial Detallado
-    wb_historial = openpyxl.Workbook()
-    sheet_historial = wb_historial.active
-    sheet_historial.title = "Historial Detallado"
-    sheet_historial.append(["Servidor", "Nombre Trabajo", "Inicio", "Fin", "Duración", "Data Read (GB)", "Tamaño Backup (GB)", "Estado"])
-
-    # Definir colores pastel
-    colores = ["ADD8E6", "CCFFCC", "FFFFCC", "E6CCFF", "FFD9C2", "F2F2F2"]
-    servidores_unicos = sorted(backups_por_servidor.keys())
-    servidor_a_color = {servidor: colores[idx % len(colores)] for idx, servidor in enumerate(servidores_unicos)}
-
-    for servidor, historial in backups_por_servidor.items():
-        color_servidor = servidor_a_color[servidor]
-        fill = PatternFill(start_color=color_servidor, end_color=color_servidor, fill_type="solid")
-
-        historial_ordenado = sorted(historial, key=lambda x: x['inicio'])
-        for intento in historial_ordenado:
-            sheet_historial.append([
-                servidor,
-                intento['nombre_trabajo'],
-                intento['inicio'].strftime(CONFIGURACION_FECHA_HORA),
-                intento['fin'].strftime(CONFIGURACION_FECHA_HORA),
-                intento['duracion'],
-                intento['data_read'],
-                intento['tamano_backup'],
-                intento['estado'].capitalize()
-            ])
-            # Aplicar color de fondo a la fila actual
-            for col in range(1, 9):  # 8 columnas
-                sheet_historial.cell(row=sheet_historial.max_row, column=col).fill = fill
-
-    wb_historial.save(os.path.join(RUTA_EXPORTACION, f"historial_detallado_backups_{fecha_actual}.xlsx"))
-    print(f"✅ Historial exportado en: resumenes_backups/historial_detallado_backups_{fecha_actual}.xlsx")
-
-def mostrar_historial(servidor, text_widget, historial):
-    text_widget.config(state=tk.NORMAL)
-    text_widget.delete(1.0, tk.END)
-
-    historial_ordenado = sorted(historial, key=lambda x: x['inicio'])
-
-    for intento in historial_ordenado:
-        detalles = [
-            f"Nombre Trabajo: {intento['nombre_trabajo']}",
-            f"Inicio: {intento['inicio'].strftime(CONFIGURACION_FECHA_HORA)}",
-            f"Fin: {intento['fin'].strftime(CONFIGURACION_FECHA_HORA)}",
-            f"Duración: {intento['duracion']}",
-            f"Data Read, GB: {intento['data_read']}",
-            f"Tamaño Backup, GB: {intento['tamano_backup']}",
-            f"Estado: {intento['estado'].capitalize()}",
-            "--"
+    for r in fallas_por_dia_servidor_trabajo.values():
+        fila = [
+            r['servidor'], r['nombre_trabajo'],
+            r['inicio'].strftime(CONFIGURACION_FECHA_HORA), # Se mantiene hora para el detalle en Excel
+            r['fin'].strftime(CONFIGURACION_FECHA_HORA),     # Se mantiene hora para el detalle en Excel
+            r['tamano_backup'], r['estado']
         ]
+        ws.append(fila)
+        resumen_estado[r['estado']] += 1
+        color = colores.get(r['estado'], "FFFFFF")
+        # Ajuste de columnas para el color
+        for col in range(1, len(fila) + 1):
+            ws.cell(row=ws.max_row, column=col).fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
 
-        color = "black"
-        if intento['estado'] == 'success':
-            color = "green"
-        elif intento['estado'] == 'failed':
-            color = "red"
-        elif intento['estado'] == 'warning':
-            color = "orange"
+    ws_resumen = wb.create_sheet(title="Resumen Fallas") # Título más específico
+    ws_resumen.append(["Estado", "Cantidad"])
+    for estado, cantidad in resumen_estado.items():
+        ws_resumen.append([estado, cantidad])
 
-        for linea in detalles:
-            text_widget.insert(tk.END, linea + "\n", color)
+    wb.save(ruta_archivo)
+    print(f"✅ Informe de Fallas exportado en: {ruta_archivo}")
 
-    estado_final = determinar_estado_final(historial)
-    text_widget.insert(tk.END, f"\nEstado Final: {estado_final}\n", "blue")
 
-    text_widget.config(state=tk.DISABLED)
+def crear_interfaz(backups_por_servidor, trabajos_por_servidor, trabajos, servidores, fechas, fechas_por_servidor_y_trabajo):
+    app = ttk.Window(themename="superhero")
+    app.title("Explorador de Backups")
+    app.geometry("1300x750")
+    app.iconbitmap ("C:/Users/eromerov/scriptTIGO.py/ServidorICONO.ico")
 
-def crear_interfaz(backups_por_servidor, resumen_estados):
-    ventana = tk.Tk()
-    ventana.title("Explorador de Backups")
+    # --- Frame superior con ícono y título ---
+    frame_top = ttk.Frame(app)
+    frame_top.pack(fill="x", padx=10, pady=10)
 
-    tk.Label(ventana, text="Servidores:").pack()
-    lista_servidores = tk.Listbox(ventana, width=50)
-    lista_servidores.pack(pady=5)
+    try:
+        icono_buscar = Image.open("C:/Users/eromerov/scriptTIGO.py/ICONObuscar.png")
+        icono_buscar = icono_buscar.resize((30, 30), Image.LANCZOS)
+        icono_tk = ImageTk.PhotoImage(icono_buscar)
+        label_icono = ttk.Label(frame_top, image=icono_tk)
+        label_icono.image = icono_tk
+        label_icono.pack(side="left", padx=(5, 10))
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar ICONObuscar.png: {e}")
 
-    servidores = sorted(backups_por_servidor.keys())
-    for servidor in servidores:
-        lista_servidores.insert(tk.END, servidor)
+    label_titulo = ttk.Label(frame_top, text="Explorador de Backups", font=("Segoe UI", 18, "bold"))
+    label_titulo.pack(side="left")
 
-    tk.Label(ventana, text="Historial de Backup:").pack()
-    text_historial = tk.Text(ventana, width=100, height=25)
-    text_historial.pack(pady=5)
+    # --- Frame de filtros ---
+    frame_filtros = ttk.LabelFrame(app, text="Filtros de Búsqueda", padding=15)
+    frame_filtros.pack(padx=10, pady=5, fill="x")
 
-    text_historial.tag_configure("green", foreground="green")
-    text_historial.tag_configure("red", foreground="red")
-    text_historial.tag_configure("orange", foreground="orange")
-    text_historial.tag_configure("black", foreground="black")
-    text_historial.tag_configure("blue", foreground="blue")
+    # Filtros de búsqueda
+    ttk.Label(frame_filtros, text="Servidor").grid(row=1, column=0, sticky="w")
+    combo_servidor = ttk.Combobox(frame_filtros, values=servidores, state="readonly", width=25)
+    combo_servidor.grid(row=1, column=1, padx=5)
 
-    def seleccionar_servidor(event):
-        seleccion = lista_servidores.curselection()
-        if seleccion:
-            servidor = lista_servidores.get(seleccion[0])
-            mostrar_historial(servidor, text_historial, backups_por_servidor[servidor])
+    ttk.Label(frame_filtros, text="Trabajo").grid(row=1, column=2, sticky="w")
+    combo_trabajo = ttk.Combobox(frame_filtros, values=[], state="readonly", width=25)
+    combo_trabajo.grid(row=1, column=3, padx=5)
 
-    lista_servidores.bind('<<ListboxSelect>>', seleccionar_servidor)
+    ttk.Label(frame_filtros, text="Fecha").grid(row=1, column=4, sticky="w")
+    combo_fecha = ttk.Combobox(frame_filtros, values=[], state="readonly", width=20)
+    combo_fecha.grid(row=1, column=5, padx=5)
 
-    ventana.mainloop()
+    ttk.Label(frame_filtros, text="Estado").grid(row=1, column=6, sticky="w")
+    combo_estado = ttk.Combobox(frame_filtros, values=["", "success", "failed", "warning"], state="readonly", width=15)
+    combo_estado.grid(row=1, column=7, padx=5)
 
+    # Botones
+    ttk.Button(frame_filtros, text="Limpiar Filtros", command=lambda: limpiar_filtros(), bootstyle=INFO).grid(row=2, column=1, pady=10)
+    ttk.Button(frame_filtros, text="Buscar", command=lambda: buscar(), bootstyle=PRIMARY).grid(row=2, column=3, pady=10)
+    ttk.Button(frame_filtros, text="Exportar a Excel", command=lambda: exportar(), bootstyle=SUCCESS).grid(row=2, column=4, pady=10)
+
+    # Logo SAVIA con créditos, mini y más a la derecha
+    try:
+        ruta_logo = "C:/Users/eromerov/scriptTIGO.py/logoSAVIA.png"
+        logo_img = Image.open(ruta_logo).convert("RGBA")
+        ancho, alto = logo_img.size
+        nuevo_alto = alto + 25
+        lienzo = Image.new("RGBA", (ancho, nuevo_alto), (255, 255, 255, 0))
+        lienzo.paste(logo_img, (0, 0))
+
+        draw = ImageDraw.Draw(lienzo)
+        texto = "Desarrollado por Eber Romero"
+        fuente = ImageFont.load_default()
+        x = (ancho - draw.textlength(texto, font=fuente)) // 2
+        y = alto + 5
+        draw.text((x, y), texto, fill="white", font=fuente)
+
+        lienzo = lienzo.resize((120, int(nuevo_alto * 120 / ancho)), Image.LANCZOS)
+        logo_tk = ImageTk.PhotoImage(lienzo)
+
+        # Colocarlo a la derecha (columna extra al final)
+        label_logo = ttk.Label(frame_filtros, image=logo_tk)
+        label_logo.image = logo_tk
+        label_logo.grid(row=0, column=10, rowspan=3, padx=30, pady=10, sticky="ns")
+    except Exception as e:
+        print(f"⚠️ No se pudo cargar el logo SAVIA: {e}")
+
+    # Área de resultados
+    text_resultado = ttk.ScrolledText(app, width=150, height=30, wrap="none", font=("Consolas", 10))
+    text_resultado.pack(padx=10, pady=10, fill="both", expand=True)
+
+    def limpiar_filtros():
+        combo_servidor.set("")
+        combo_trabajo.set("")
+        combo_fecha.set("")
+        combo_estado.set("")
+        # Limpiar resultados también
+        text_resultado.delete(1.0, ttk.END)
+
+    def buscar():
+        text_resultado.delete(1.0, ttk.END)
+        filtro_srv = combo_servidor.get().strip()
+        filtro_job = combo_trabajo.get().strip()
+        filtro_fecha = combo_fecha.get().strip()
+        filtro_estado = combo_estado.get().strip()
+
+        resultados_filtrados = [] # Para almacenar todos los backups que cumplen los filtros
+        # Para el resumen diario (distinct por servidor, trabajo y fecha)
+        resumen_diario_fallas = {}
+
+        for servidor, historial in backups_por_servidor.items():
+            if filtro_srv and filtro_srv != servidor:
+                continue
+            for intento in historial:
+                # Si el estado es "success", no lo consideramos como una falla real para el resumen diario
+                if intento['estado'] == 'success':
+                    continue
+
+                if filtro_job and filtro_job != intento['nombre_trabajo']:
+                    continue
+                # Aquí se formatea la fecha para comparar solo la parte de la fecha
+                if filtro_fecha and filtro_fecha != intento['inicio'].strftime('%Y-%m-%d'):
+                    continue
+                if filtro_estado and filtro_estado != intento['estado']:
+                    continue
+
+                resultados_filtrados.append({**intento, 'servidor': servidor})
+
+                # Lógica para el "distinct" por día del mismo servidor y trabajo
+                clave_diaria = (servidor, intento['nombre_trabajo'], intento['inicio'].date())
+                # Si la clave no está o si el intento actual es más reciente, lo actualiza
+                if clave_diaria not in resumen_diario_fallas or intento['inicio'] > resumen_diario_fallas[clave_diaria]['inicio']:
+                    resumen_diario_fallas[clave_diaria] = {**intento, 'servidor': servidor}
+
+
+        if resultados_filtrados:
+            # Ordenar todos los resultados para una mejor visualización (opcional)
+            resultados_filtrados.sort(key=lambda x: (x['servidor'], x['nombre_trabajo'], x['inicio']))
+
+            text_resultado.insert(ttk.END, "📝 Todos los intentos (filtrados por falla):\n")
+            # Mostrar todos los intentos que cumplen los filtros (incluyendo fallas individuales)
+            for r in resultados_filtrados:
+                # Aquí se muestra solo la fecha
+                text_resultado.insert(ttk.END, f"{r['inicio'].strftime('%Y-%m-%d %H:%M:%S')} | {r['servidor']} | {r['nombre_trabajo']} | Estado: {r['estado']}\n")
+
+            text_resultado.insert(ttk.END, "\n--- Resumen de Fallas Diarias (por Servidor y Trabajo) ---\n")
+            # Convertir el diccionario a una lista y ordenar para mostrar consistentemente
+            fallas_para_mostrar = sorted(resumen_diario_fallas.values(), key=lambda x: (x['servidor'], x['nombre_trabajo'], x['inicio'].date()))
+
+            if fallas_para_mostrar:
+                for r in fallas_para_mostrar:
+                    # Aquí se muestra solo la fecha, como un distinct por día
+                    text_resultado.insert(ttk.END, f"📅 {r['inicio'].strftime('%Y-%m-%d')} | Servidor: {r['servidor']} | Trabajo: {r['nombre_trabajo']} | Estado: {r['estado']}\n")
+            else:
+                text_resultado.insert(ttk.END, "No hay fallas únicas por día que cumplan los filtros.\n")
+
+        else:
+            text_resultado.insert(ttk.END, "No se encontraron fallas con los filtros dados.\n")
+
+
+    def exportar():
+        filtro_srv = combo_servidor.get().strip()
+        filtro_job = combo_trabajo.get().strip()
+        filtro_fecha = combo_fecha.get().strip()
+        filtro_estado = combo_estado.get().strip()
+
+        resultados_para_exportar = []
+        for servidor, historial in backups_por_servidor.items():
+            if filtro_srv and filtro_srv != servidor:
+                continue
+            for intento in historial:
+                # Solo exportar fallas (failed, warning), ignorar 'success' para el informe de fallas
+                if intento['estado'] == 'success':
+                    continue
+
+                if filtro_job and filtro_job != intento['nombre_trabajo']:
+                    continue
+                if filtro_fecha and filtro_fecha != intento['inicio'].strftime('%Y-%m-%d'):
+                    continue
+                if filtro_estado and filtro_estado != intento['estado']:
+                    continue
+                resultados_para_exportar.append({**intento, 'servidor': servidor})
+
+        if resultados_para_exportar:
+            exportar_excel(resultados_para_exportar) # Llama a la función de exportación
+        else:
+            ttk.messagebox.showinfo("Exportar", "No hay fallas para exportar con los filtros dados.")
+
+    app.mainloop()
+
+
+# --- MAIN ---
 if __name__ == "__main__":
     try:
         print("🚀 Cargando datos...")
-        backups_servidor = analizar_informes(RUTA_INFORMES)
-
-        if not backups_servidor:
-            print("⚠️ No se encontraron backups.")
-            exit()
-
-        resumen_estados = {srv: determinar_estado_final(historial) for srv, historial in backups_servidor.items()}
-
-        exportar_resumenes(backups_servidor, resumen_estados)
-
-        crear_interfaz(backups_servidor, resumen_estados)
-
+        backups_servidor, trabajos_por_servidor, trabajos, servidores, fechas, fechas_por_servidor_y_trabajo = analizar_informes(RUTA_INFORMES)
+        crear_interfaz(backups_servidor, trabajos_por_servidor, trabajos, servidores, fechas, fechas_por_servidor_y_trabajo)
     except Exception as e:
         logging.error(f"Error general: {e}")
         print(f"❌ Error en la aplicación: {e}")
